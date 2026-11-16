@@ -5,10 +5,11 @@
 </p>
 
 <p align="center">
-  <img alt="Python Version" src="https://img.shields.io/badge/Python-3.10%20~%203.13-blue.svg">
+  <img alt="Python Version" src="https://img.shields.io/badge/Python-3.10%20~%203.14-blue.svg">
   <img alt="GUI Framework" src="https://img.shields.io/badge/GUI-PyQt5-green.svg">
   <img alt="Release Build" src="https://img.shields.io/badge/Build-PyInstaller%20%2B%20UPX-orange.svg">
   <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows-lightgrey.svg">
+  <img alt="Downloads" src="https://img.shields.io/github/downloads/waves-dylan/MusicDown/total?label=下载量&color=brightgreen">
 </p>
 
 **MusicDownload** 是一款基于 Python 和 PyQt5 构建的高性能全功能音乐下载与元数据增强工具。本项目以开源项目 [musicdl](https://github.com/CharlesPikachu/musicdl) 为基础引擎，进行了深度的架构重构、功能扩展与交互现代化改造，全面解决了原版在音源匹配、元数据写入、歌词对齐及打包体积上的痛点。
@@ -41,18 +42,31 @@
 * **双层渐进保障**：优先使用 `zhconv` 进行词组级精确转换；在纯离线或无第三方库环境下，自动降级至内置高频繁简汉字映射表；
 * **严格格式保护**：严格保护 LRC 时间戳 `[mm:ss.xx]`、歌曲元数据 `[ti:]` 以及日文假名、韩文谚文，绝不误伤非汉字文本。
 
-#### 5. ⚡ 现代 PyQt5 界面与极致异步性能
+#### 5. 💾 智能使用偏好记忆与绿色便携配置 (`config_manager.py`)
+* **纯绿色便携存储**：基于本地 `config.ini` 与 `QSettings(IniFormat)`，软件拷入移动设备即插即用，同时内置越界屏幕防护与只读目录 `%APPDATA%` 自动回退保护；
+* **全方位记忆使用习惯**：
+  * **下载与路径**：自动记住自定义保存目录（支持界面一键快速"打开目录"）、单源结果上限、下载范围（全选/勾选/未选）、搜索后自动下载；
+  * **音源平台偏好**：精准保留用户自定义勾选的音乐平台组合，提供「全选」、「清空」、「国内主流」、「重置默认」一键预设；
+  * **界面与交互状态**：关闭时自动静默保存窗口尺寸与停靠位置、结果表格各列拖拽后的宽度与排列状态；
+  * **搜索历史自动补全**：内置最近搜索历史记忆与下拉模糊匹配，支持一键清空；
+  * **配置定位与出厂重置**：顶部菜单提供「偏好设置」，支持一键在资源管理器中定位 `config.ini`，并支持一键恢复出厂设置。
+
+#### 6. ⚡ 现代 PyQt5 界面与全场景动态过程遥测 (Project Telemetry)
+* **终端 Console + 桌面 GUI 双模动态过程显示**：
+  * **终端沉浸式交互**：原生集成基于 `rich` 的多任务细线动态进度条、多源分页搜索树、瞬时网速（MB/s）与剩余时间精准倒计时；
+  * **PyQt5 现代多任务监视仪表盘**：内置 `ModernProgressDialog`，支持单曲微缩卡片组、彩虹细线进度条、各任务状态胶囊（排队/下载中/歌词时序对齐/写入标签/完成/失败）；
+  * **10 FPS 安全节流与 EWMA 平滑算法**：千兆突发 chunk 下 UI 依然丝滑不卡顿，CPU 占用率低于 1%，平滑解决速度数值剧烈跳变痛点。
 * **封面异步线程池流式加载**：引入代际缓存（Generational Cache）与多线程图像处理，海量搜索结果快速滚动时界面丝滑不卡顿；
-* **多线程并发下载**：下载线程与 UI 深度解耦，支持实时下载进度百分比、动态速率与耗时统计；
 * **现代化交互组件**：
   * 支持自适应换行流式布局（FlowLayout），音源筛选自由缩放；
   * 表头集成一键全选/反选多态复选框；
+  * 搜索框支持 **Enter 回车直接搜索**，无需手动点击按钮；
   * 支持右键上下文菜单、双击详情查看；
   * 抽屉式可折叠的实时运行日志面板。
 
-#### 6. 📦 纯净虚拟环境与极致瘦身打包
-* **一键打包脚本**：内置 [make_release.bat](file:///f:/musicDownload/make_release.bat)，自动检测 `.venv` 隔离环境；
-* **深度结构性瘦身**：在 [musicdownload.spec](file:///f:/musicDownload/musicdownload.spec) 中剔除 `numpy`、`matplotlib`、`pandas`、`av`、`lxml` 等庞大无用库，并移除 PyQt5 冗余的 20MB `opengl32sw.dll` 驱动；
+#### 7. 📦 纯净虚拟环境与极致瘦身打包
+* **一键打包脚本**：内置 `make_release.bat`，自动检测 `.venv` 隔离环境；
+* **深度结构性瘦身**：在 `musicdownload.spec` 中剔除 `numpy`、`matplotlib`、`pandas`、`av`、`lxml` 等庞大无用库，并移除 PyQt5 冗余的 20MB `opengl32sw.dll` 驱动；
 * **UPX 深度压缩与崩溃白名单保护**：将输出单文件体积压缩至约 **44 MB**，同时对 Qt 平台插件与 VC 运行时设置白名单，保证程序运行稳定不崩溃。
 
 ---
@@ -81,14 +95,18 @@
 ### 📂 项目架构
 
 ```text
-musicDownload/
+MusicDown/
 ├── musicdownload.py        # 主程序入口：包含现代化 PyQt5 GUI、多线程并发控制器与业务逻辑
+├── telemetry_hub.py        # 核心模块：统一过程遥测中枢、EWMA速率平滑算法与 Rich 终端渲染器
+├── telemetry_widgets.py    # 界面组件：PyQt5 现代化多任务下载仪表盘、流式卡片与 10 FPS 节流桥
+├── config_manager.py       # 偏好配置模块：基于本地 INI 的集中式使用习惯与窗口状态持久化
 ├── audio_metadata.py       # 模块一：音频底层容器探测、安全重试与元数据/封面写入引擎
 ├── bilingual_lyric.py      # 模块二：双语歌词时序对齐、格式重构与跨源补全模块
 ├── zh_converter.py         # 模块三：中文简繁体智能转换模块（双层渐进式保护）
 ├── musicdownload.spec      # PyInstaller 专业瘦身与依赖隔离打包配置文件
 ├── make_release.bat        # Windows 纯净虚拟环境 + UPX 一键自动化打包脚本
 ├── requirements.txt        # 核心依赖清单
+├── config.ini              # 绿色便携用户偏好配置文件（自动生成）
 ├── tools/                  # 打包工具依赖（内置 Windows 平台 UPX 压缩程序）
 │   └── upx/
 │       └── upx.exe
@@ -100,7 +118,7 @@ musicDownload/
 ### 🚀 快速上手
 
 #### 运行环境
-* 建议使用 **Python 3.10 ~ 3.13**。
+* 建议使用 **Python 3.10 ~ 3.14**。
 
 #### 源码运行步骤
 ```bash
@@ -129,7 +147,7 @@ python musicdownload.py
 # 确保在项目根目录下，直接双击或在命令行运行：
 .\make_release.bat
 ```
-打包成功后，输出的单文件可执行程序将自动同步在项目根目录下的 [musicdownload.exe](file:///f:/musicDownload/musicdownload.exe)。
+打包成功后，输出的单文件可执行程序将自动同步在项目根目录下的 `musicdownload.exe`。
 
 ---
 

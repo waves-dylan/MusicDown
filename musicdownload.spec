@@ -8,6 +8,9 @@ tmp_ret = collect_all('musicdl')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_zhconv = collect_all('zhconv')
 datas += tmp_zhconv[0]; binaries += tmp_zhconv[1]; hiddenimports += tmp_zhconv[2]
+tmp_rich = collect_all('rich')
+datas += tmp_rich[0]; binaries += tmp_rich[1]; hiddenimports += tmp_rich[2]
+hiddenimports += ['telemetry_hub', 'telemetry_widgets']
 
 
 

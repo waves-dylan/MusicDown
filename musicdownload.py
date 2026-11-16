@@ -59,6 +59,28 @@ except Exception as _bilingual_import_error:
     BILINGUAL_LYRIC_AVAILABLE = False
     print(f"警告：双语歌词增强模块加载失败（{_bilingual_import_error}），将使用基础单语歌词")
 
+# 导入集中式偏好配置管理器 (基于绿色便携 config.ini)
+from config_manager import get_config, get_app_dir
+
+# 导入过程遥测与多任务进度中枢 (Project Telemetry: 双模驱动)
+try:
+    from telemetry_hub import TelemetryEventHub, TaskStage, TelemetryUtils
+    TELEMETRY_AVAILABLE = True
+except Exception as _telemetry_err:
+    TELEMETRY_AVAILABLE = False
+    TelemetryEventHub = None
+    TaskStage = None
+    TelemetryUtils = None
+    print(f"警告：遥测事件中枢加载失败: {_telemetry_err}")
+
+try:
+    from telemetry_widgets import ModernProgressDialog
+    MODERN_PROGRESS_AVAILABLE = True
+except Exception as _widgets_err:
+    MODERN_PROGRESS_AVAILABLE = False
+    ModernProgressDialog = None
+    print(f"警告：现代进度控件加载失败: {_widgets_err}")
+
 
 
 # 搜索结果排序方式（“默认顺序” = 按音乐源返回的原始顺序）
@@ -752,6 +774,70 @@ def _install_musicdl_patches():
         IOUtils.touchdir = staticmethod(_patched_touchdir)
     except Exception as e:
         print(f"touchdir 补丁安装失败: {e}")
+
+    # ==================== Telemetry 流式进度与终端集中调度补丁 ====================
+    try:
+        orig_base_download = BaseMusicClient._download
+
+        class _ProgressHookProxy:
+            """轻量线程安全代理：拦截当前歌曲的 chunk 推进与总大小更新，绝不污染客户端实例"""
+            def __init__(self, target_progress, task_id):
+                self._target = target_progress
+                self._task_id = task_id
+
+            def advance(self, pid, advance=1):
+                if self._task_id and advance > 0 and TELEMETRY_AVAILABLE:
+                    try:
+                        TelemetryEventHub.get_instance().update_task_progress(
+                            self._task_id,
+                            advance_bytes=int(advance),
+                            stage=TaskStage.DOWNLOADING,
+                        )
+                    except Exception:
+                        pass
+                if self._target and hasattr(self._target, 'advance'):
+                    return self._target.advance(pid, advance)
+
+            def update(self, pid, *args, **kwargs):
+                if self._task_id and kwargs.get('total') and kwargs['total'] > 0 and TELEMETRY_AVAILABLE:
+                    try:
+                        TelemetryEventHub.get_instance().update_task_progress(
+                            self._task_id,
+                            total_bytes=int(kwargs['total']),
+                        )
+                    except Exception:
+                        pass
+                if self._target and hasattr(self._target, 'update'):
+                    return self._target.update(pid, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._target, name)
+
+        def _telemetry_base_download(self, song_info, request_overrides=None, downloaded_song_infos=None,
+                                    progress=None, song_progress_id=0, auto_supplement_song=True):
+            task_id = getattr(song_info, '_telemetry_task_id', None)
+            hooked_progress = _ProgressHookProxy(progress, task_id) if task_id else progress
+            return orig_base_download(
+                self, song_info, request_overrides=request_overrides,
+                downloaded_song_infos=downloaded_song_infos, progress=hooked_progress,
+                song_progress_id=song_progress_id, auto_supplement_song=auto_supplement_song
+            )
+
+        BaseMusicClient._download = _telemetry_base_download
+
+        # 当 TelemetryEventHub 启动并接管终端渲染时，静默内部零散的 Progress，防止多线程光标冲突
+        import musicdl.modules.sources.base as _m_base
+        orig_m_base_progress = getattr(_m_base, 'Progress', None)
+        if orig_m_base_progress:
+            def _quiet_m_base_progress(*args, **kwargs):
+                # 若全局事件中枢活跃，则静音底层重复进度条
+                hub = TelemetryEventHub.get_instance() if TELEMETRY_AVAILABLE else None
+                if hub and getattr(hub._terminal_renderer, '_is_active', False):
+                    kwargs['disable'] = True
+                return orig_m_base_progress(*args, **kwargs)
+            _m_base.Progress = _quiet_m_base_progress
+    except Exception as e:
+        print(f"telemetry 补丁安装失败: {e}")
 
     _install_musicdl_patches._installed = True
 
@@ -1657,8 +1743,22 @@ class SearchThread(QThread):
             self.log.emit("正在搜索音乐（无法获取细粒度进度）……")
             return self.music_client.search(keyword=self.keyword)
 
+        hub = TelemetryEventHub.get_instance() if TELEMETRY_AVAILABLE else None
+        if hub:
+            hub.start_session(title=f"搜索「{self.keyword}」", total_items=len(sources), category="search")
+            for src in sources:
+                src_cn = self.source_names.get(src, src)
+                hub.add_task(
+                    task_id=f"search_{src}",
+                    category="search",
+                    title=f"音源检索：{src_cn}",
+                    subtitle=self.keyword,
+                    source=src_cn,
+                )
+
         self._progress_lock = threading.Lock()
-        self._rich_progress = _RichProgress(disable=True)
+        is_tty = bool(hub and hub._terminal_renderer.is_terminal_attached())
+        self._rich_progress = _RichProgress(disable=not is_tty)
         self._rich_task_id = self._rich_progress.add_task("Search From Sources", total=0)
         started_at = time.time()
         self.log.emit(f"开始搜索「{self.keyword}」，共 {len(sources)} 个音源")
@@ -1668,8 +1768,12 @@ class SearchThread(QThread):
             client = getattr(self.music_client, "music_clients", {}).get(source)
             if client is None:
                 self.log.emit(f"✖ {source_cn}：客户端不可用，已跳过")
+                if hub:
+                    hub.set_task_stage(f"search_{source}", TaskStage.FAILED, error_message="客户端不可用")
                 return source, []
             self.log.emit(f"▶ {source_cn}：开始搜索")
+            if hub:
+                hub.set_task_stage(f"search_{source}", TaskStage.SEARCHING, status_text="正在检索...")
             begin = time.time()
             try:
                 items = client.search(
@@ -1683,15 +1787,21 @@ class SearchThread(QThread):
                 )
             except Exception as err:
                 self.log.emit(f"✖ {source_cn}：搜索失败（{err}）")
+                if hub:
+                    hub.set_task_stage(f"search_{source}", TaskStage.FAILED, error_message=str(err))
                 return source, []
             found = len(items or [])
             self.log.emit(f"✔ {source_cn}：找到 {found} 首，用时 {time.time() - begin:.1f} 秒")
+            if hub:
+                hub.set_task_stage(f"search_{source}", TaskStage.SUCCESS, status_text=f"✔ 找到 {found} 首")
             return source, items
 
         with ThreadPoolExecutor(max_workers=min(len(sources), 10)) as pool:
             results = dict(pool.map(search_func, sources))
         total_found = sum(len(items or []) for items in results.values())
         self.log.emit(f"搜索结束：{len(sources)} 个音源共 {total_found} 首，用时 {time.time() - started_at:.1f} 秒")
+        if hub:
+            hub.end_session()
         return results
 
     def run(self):
@@ -1829,6 +1939,9 @@ class DownloadThread(QThread):
         self.zh_convert_mode = zh_convert_mode
 
     def _download_one(self, song_info):
+        tid = getattr(song_info, '_telemetry_task_id', None)
+        hub = TelemetryEventHub.get_instance() if TELEMETRY_AVAILABLE else None
+
         name = _song_text(song_info, "song_name") or "未知歌曲"
         singers = _song_text(song_info, "singers")
         label = f"{name} - {singers}" if singers else name
@@ -1843,6 +1956,11 @@ class DownloadThread(QThread):
                 target_song = copy.deepcopy(song_info)
                 target_song.work_dir = stage_dir
                 target_song._save_path = None
+                target_song._telemetry_task_id = tid
+
+            if hub and tid:
+                hub.set_task_stage(tid, TaskStage.PROCESSING_LYRICS, status_text="正在对齐双语歌词...")
+
             _ensure_song_lyric(
                 target_song,
                 song_info,
@@ -1850,11 +1968,26 @@ class DownloadThread(QThread):
                 layout=self.lyric_layout,
                 zh_convert=self.zh_convert_mode
             )
+
+            if hub and tid:
+                hub.set_task_stage(tid, TaskStage.DOWNLOADING, status_text="正在连接音源下载...")
+
             try:
                 downloaded = self.music_client.download(song_infos=[target_song])
             except Exception as err:
+                if hub and tid:
+                    hub.set_task_stage(tid, TaskStage.FAILED, error_message=str(err))
                 return label, [], str(err), [], []
+
             results = list(downloaded or [])
+            if not results:
+                if hub and tid:
+                    hub.set_task_stage(tid, TaskStage.FAILED, error_message="下载链接可能已失效")
+                return label, [], "下载链接可能已失效", [], []
+
+            if hub and tid:
+                hub.set_task_stage(tid, TaskStage.REPAIRING_METADATA, status_text="正在写入元数据与封面...")
+
             # musicdl 自带写标签，但它遇到文件被占用会静默回退；在移入目标目录前就地校验并补齐音轨号/封面
             notes, issues = [], []
             for item in results:
@@ -1863,17 +1996,39 @@ class DownloadThread(QThread):
                 issues.extend(item_issues)
                 if use_staging:
                     _promote_staged_item(item, orig_work_dir)
+
+            if hub and tid:
+                hub.set_task_stage(tid, TaskStage.SUCCESS, status_text="✔ 下载完成")
+
             return label, results, None, notes, issues
         finally:
             if stage_dir and os.path.exists(stage_dir):
                 shutil.rmtree(stage_dir, ignore_errors=True)
 
     def run(self):
+        hub = TelemetryEventHub.get_instance() if TELEMETRY_AVAILABLE else None
         try:
             total = len(self.song_infos)
             if total == 0:
                 self.finished.emit(0)
                 return
+
+            if hub:
+                hub.start_session(title=f"正在下载 {total} 首歌曲", total_items=total)
+                for idx, song_info in enumerate(self.song_infos):
+                    tid = f"dl_song_{idx}_{id(song_info)}"
+                    song_info._telemetry_task_id = tid
+                    name = _song_text(song_info, "song_name") or "未知歌曲"
+                    singers = _song_text(song_info, "singers") or ""
+                    source = getattr(song_info, "source", "MusicClient")
+                    hub.add_task(
+                        task_id=tid,
+                        category="download",
+                        title=name,
+                        subtitle=singers,
+                        source=source,
+                    )
+
             self.log.emit(f"开始下载：共 {total} 首歌曲（同时下载 {self.max_workers} 首）")
             self.progress.emit(0, total)
             downloaded_song_infos = []
@@ -1902,8 +2057,15 @@ class DownloadThread(QThread):
             self.log.emit(f"下载结束：成功 {len(downloaded_song_infos)} 首，失败 {failures} 首")
             self.log.emit("正在补全专辑曲目编号……")
             _write_album_track_numbers(downloaded_song_infos, self.log.emit)
+            if hub:
+                hub.end_session()
             self.finished.emit(len(downloaded_song_infos))
         except Exception as e:
+            if hub:
+                try:
+                    hub.end_session()
+                except Exception:
+                    pass
             self.error.emit(str(e))
 
 # 进度弹窗：显示实际进度、百分比，以及可展开/收起的搜索下载过程详情
@@ -2001,13 +2163,14 @@ class SimpleProgressDialog(QDialog):
     @staticmethod
     def _load_details_preference():
         try:
-            return QSettings("musicdl", "MusicDownloader").value("show_process_details", False, type=bool)
+            return get_config().get_bool("ui/show_process_details", False)
         except Exception:
             return False
 
     def _save_details_preference(self, visible):
         try:
-            QSettings("musicdl", "MusicDownloader").setValue("show_process_details", bool(visible))
+            get_config().set("ui/show_process_details", bool(visible))
+            get_config().sync()
         except Exception:
             pass
 
@@ -2142,6 +2305,11 @@ class MusicDownloader(QMainWindow):
         self.resize(1400, 900)
         self.setStyleSheet(self.get_modern_style())
         
+        # 集中式偏好配置管理器
+        self.config = get_config()
+        self.app_dir = get_app_dir()
+        self.current_dir = self.app_dir
+        
         # 音乐源中英文映射
         self.source_map_cn_to_en = {
             "苹果音乐": "AppleMusicClient", "Deezer": "DeezerMusicClient", "5sing": "FiveSingMusicClient",
@@ -2170,13 +2338,18 @@ class MusicDownloader(QMainWindow):
         self.render_generation = 0     # 每次重排递增，用于丢弃过期的封面回调
         self.cover_cache = {}          # 封面 URL -> QPixmap，重排时不再重复下载
         
-        # 设置当前路径和保存目录
-        self.current_dir = os.getcwd()
-        self.save_dir = os.path.join(self.current_dir, "已下载音乐")
+        # 加载记住的保存目录（如果保存目录不存在，回退至 app_dir/已下载音乐）
+        default_save_dir = os.path.join(self.app_dir, "已下载音乐")
+        saved_dir = self.config.get_str("download/save_dir", "").strip()
+        if saved_dir and os.path.exists(saved_dir):
+            self.save_dir = os.path.abspath(saved_dir)
+        else:
+            self.save_dir = default_save_dir
         _makedirs_music_folder(self.save_dir, exist_ok=True)
         
         # 搜索后直接下载开关
-        self.auto_download_after_search = False
+        self.auto_download_after_search = self.config.get_bool("download/auto_download", False)
+        self.active_progress_dialog = None
         
         central = QWidget()
         self.setCentralWidget(central)
@@ -2184,15 +2357,114 @@ class MusicDownloader(QMainWindow):
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(16)
         
+        self.setup_menu_bar()
         self.setup_top(main_layout)
         self.setup_table(main_layout)
+
+        # 恢复窗口位置与几何尺寸（带屏幕越界防呆保护）
+        self.restore_window_geometry()
+
+        # 恢复表格列宽与表头排列状态
+        header_state = self.config.get_byte_array("ui/table_header_state")
+        if header_state and not header_state.isEmpty():
+            self.results_table.horizontalHeader().restoreState(header_state)
+            self._position_header_select()
         
         if not MUSICDL_AVAILABLE:
             QMessageBox.warning(self, "警告", "musicdl 库未安装！\n请运行: pip install musicdl")
 
+    def restore_window_geometry(self):
+        """恢复窗口大小与屏幕位置，若超出当前显示器边界则居中。"""
+        geom = self.config.get_byte_array("ui/window_geometry")
+        if geom and not geom.isEmpty():
+            self.restoreGeometry(geom)
+            desktop = QApplication.desktop()
+            if not desktop.availableGeometry(self).intersects(self.geometry()):
+                primary_geo = desktop.availableGeometry(desktop.primaryScreen())
+                self.setGeometry(
+                    max(50, primary_geo.center().x() - 700),
+                    max(50, primary_geo.center().y() - 450),
+                    1400, 900
+                )
+
+    def setup_menu_bar(self):
+        """初始化顶部菜单栏（偏好设置、目录打开与重置）。"""
+        menubar = self.menuBar()
+        pref_menu = menubar.addMenu("偏好设置 (&P)")
+
+        action_open_config = QAction("📁 打开配置文件目录", self)
+        action_open_config.setStatusTip("在资源管理器中定位 config.ini 文件")
+        action_open_config.triggered.connect(self.on_open_config_dir)
+        pref_menu.addAction(action_open_config)
+
+        action_open_down = QAction("📂 打开当前下载目录", self)
+        action_open_down.setStatusTip("在资源管理器中打开保存音乐的文件夹")
+        action_open_down.triggered.connect(self.on_open_save_dir)
+        pref_menu.addAction(action_open_down)
+
+        pref_menu.addSeparator()
+
+        action_clear_history = QAction("🧹 清空搜索历史记录", self)
+        action_clear_history.setStatusTip("清除搜索输入框的下拉历史提示")
+        action_clear_history.triggered.connect(self.on_clear_search_history)
+        pref_menu.addAction(action_clear_history)
+
+        pref_menu.addSeparator()
+
+        action_reset = QAction("🔄 恢复所有默认偏好...", self)
+        action_reset.setStatusTip("将保存目录、音源勾选、排序、窗口大小等重置为初始状态")
+        action_reset.triggered.connect(self.on_reset_preferences)
+        pref_menu.addAction(action_reset)
+
+        # 运行任务看板菜单
+        board_menu = menubar.addMenu("任务看板 (&T)")
+        action_show_board = QAction("📊 查看当前运行看板", self)
+        action_show_board.setShortcut("Ctrl+T")
+        action_show_board.setStatusTip("重新呼出正在执行或刚完成的下载/搜索任务看板 (快捷键: Ctrl+T)")
+        action_show_board.triggered.connect(self.show_active_progress_dialog)
+        board_menu.addAction(action_show_board)
+
     def get_modern_style(self):
         return """
         QMainWindow { background-color: #f8f9fa; }
+        QMenuBar {
+            background-color: #ffffff;
+            border-bottom: 1px solid #e5e7eb;
+            padding: 2px 8px;
+            font-size: 10pt;
+        }
+        QMenuBar::item {
+            spacing: 6px;
+            padding: 5px 12px;
+            background: transparent;
+            border-radius: 4px;
+            color: #374151;
+        }
+        QMenuBar::item:selected {
+            background-color: #f1f5f9;
+            color: #0078d4;
+        }
+        QMenu {
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            padding: 4px;
+            font-size: 10pt;
+        }
+        QMenu::item {
+            padding: 6px 22px;
+            border-radius: 4px;
+            color: #1f2937;
+        }
+        QMenu::item:selected {
+            background-color: #0078d4;
+            color: white;
+        }
+        QMenu::separator {
+            height: 1px;
+            background: #e2e8f0;
+            margin: 4px 8px;
+        }
         QGroupBox {
             font-size: 11pt; font-weight: bold; color: #2c3e50;
             border: 1px solid #dce1e6; border-radius: 8px;
@@ -2223,42 +2495,88 @@ class MusicDownloader(QMainWindow):
         
         # 音乐来源
         group = QGroupBox("音乐来源")
+        group_layout = QVBoxLayout()
+        group_layout.setSpacing(8)
+
+        # 快捷筛选操作条
+        quick_bar = QHBoxLayout()
+        quick_bar.setSpacing(8)
+        lbl_hint = QLabel("快捷筛选：")
+        lbl_hint.setStyleSheet("color: #64748b; font-size: 9pt;")
+        quick_bar.addWidget(lbl_hint)
+
+        btn_src_all = QPushButton("全选")
+        btn_src_none = QPushButton("清空")
+        btn_src_domestic = QPushButton("国内主流")
+        btn_src_default = QPushButton("重置默认")
+
+        btn_style = (
+            "QPushButton { background-color: #e2e8f0; color: #334155; font-size: 9pt; "
+            "padding: 3px 10px; min-height: 20px; font-weight: normal; } "
+            "QPushButton:hover { background-color: #cbd5e1; }"
+        )
+        for btn in [btn_src_all, btn_src_none, btn_src_domestic, btn_src_default]:
+            btn.setStyleSheet(btn_style)
+            quick_bar.addWidget(btn)
+        quick_bar.addStretch()
+        group_layout.addLayout(quick_bar)
+
         flow = FlowLayout()
         self.source_checkboxes = []
+        saved_sources = set(self.config.get_list("sources/selected", DEFAULT_SOURCES))
         for chinese_name in self.source_map_cn_to_en.keys():
             cb = QCheckBox(chinese_name)
-            if chinese_name in DEFAULT_SOURCES:
+            if chinese_name in saved_sources:
                 cb.setChecked(True)
+            cb.stateChanged.connect(self.on_source_selection_changed)
             self.source_checkboxes.append(cb)
             flow.addWidget(cb)
-        group.setLayout(flow)
+        group_layout.addLayout(flow)
+        group.setLayout(group_layout)
         layout.addWidget(group)
+
+        btn_src_all.clicked.connect(self.select_all_sources)
+        btn_src_none.clicked.connect(self.clear_all_sources)
+        btn_src_domestic.clicked.connect(self.select_domestic_sources)
+        btn_src_default.clicked.connect(self.reset_default_sources)
         
         # 结果数量限制 + 保存目录 + 自动下载选项
         h1 = QHBoxLayout()
         label_limit = QLabel("结果数量：")
         self.spin_limit = QSpinBox()
         self.spin_limit.setRange(1, 100)
-        self.spin_limit.setValue(100)
+        saved_limit = self.config.get_int("download/limit_per_source", 100)
+        self.spin_limit.setValue(max(1, min(100, saved_limit)))
         self.spin_limit.setSuffix(" 条/源")
+        self.spin_limit.valueChanged.connect(lambda val: self.config.set("download/limit_per_source", val))
         
         label_save = QLabel("保存目录：")
         self.save_dir_edit = QLineEdit(self.save_dir)
         self.save_dir_edit.setReadOnly(True)
         self.btn_browse = QPushButton("浏览...")
         self.btn_browse.clicked.connect(self.on_browse_save_dir)
+
+        self.btn_open_dir = QPushButton("打开目录")
+        self.btn_open_dir.setStyleSheet(
+            "QPushButton { background-color: #e2e8f0; color: #334155; font-size: 9pt; "
+            "padding: 6px 12px; font-weight: normal; } QPushButton:hover { background-color: #cbd5e1; }"
+        )
+        self.btn_open_dir.clicked.connect(self.on_open_save_dir)
+        self.btn_open_dir.setToolTip("在文件资源管理器中打开当前保存目录")
         
         # 自动下载复选框
         self.check_auto_download = QCheckBox("🚀 搜索后自动下载全部")
+        self.check_auto_download.setChecked(self.auto_download_after_search)
         self.check_auto_download.stateChanged.connect(self.on_auto_download_toggle)
         
         h1.addWidget(label_limit)
         h1.addWidget(self.spin_limit)
-        h1.addSpacing(30)
+        h1.addSpacing(20)
         h1.addWidget(label_save)
         h1.addWidget(self.save_dir_edit)
         h1.addWidget(self.btn_browse)
-        h1.addSpacing(30)
+        h1.addWidget(self.btn_open_dir)
+        h1.addSpacing(20)
         h1.addWidget(self.check_auto_download)
         h1.addStretch()
         layout.addLayout(h1)
@@ -2267,8 +2585,23 @@ class MusicDownloader(QMainWindow):
         h2 = QHBoxLayout()
         self.search_mode = QComboBox()
         self.search_mode.addItems(["搜索歌曲", "解析歌单链接"])
+        saved_search_mode = self.config.get_str("search/mode", "搜索歌曲")
+        idx_mode = self.search_mode.findText(saved_search_mode)
+        if idx_mode >= 0:
+            self.search_mode.setCurrentIndex(idx_mode)
+        self.search_mode.currentTextChanged.connect(lambda text: self.config.set("search/mode", text))
+
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("输入关键词或歌单链接...")
+        self.search_history = self.config.get_list("search/history", [])
+        self.history_model = QStringListModel(self.search_history, self)
+        self.search_completer = QCompleter(self.history_model, self)
+        self.search_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.search_completer.setFilterMode(Qt.MatchContains)
+        self.search_edit.setCompleter(self.search_completer)
+
+        self.search_edit.returnPressed.connect(self.on_search)
+
         self.btn_search = QPushButton("搜索")
         self.btn_search.clicked.connect(self.on_search)
         h2.addWidget(self.search_mode)
@@ -2285,7 +2618,13 @@ class MusicDownloader(QMainWindow):
         batch = QHBoxLayout()
         self.combo_download_scope = QComboBox()
         self.combo_download_scope.addItems(["全选", "勾选", "未勾选"])
-        self.combo_download_scope.setCurrentText(DEFAULT_DOWNLOAD_SCOPE)
+        saved_scope = self.config.get_str("download/scope", DEFAULT_DOWNLOAD_SCOPE)
+        idx_scope = self.combo_download_scope.findText(saved_scope)
+        if idx_scope >= 0:
+            self.combo_download_scope.setCurrentIndex(idx_scope)
+        self.combo_download_scope.currentTextChanged.connect(
+            lambda text: self.config.set("download/scope", text)
+        )
         self.btn_download = QPushButton("下载选中")
         self.btn_download.clicked.connect(self.on_download)
         self.btn_download.setEnabled(False)
@@ -2297,13 +2636,18 @@ class MusicDownloader(QMainWindow):
         batch.addWidget(QLabel("排序："))
         self.combo_sort = QComboBox()
         self.combo_sort.addItems(SORT_MODES)
-        self.combo_sort.setCurrentText(DEFAULT_SORT_MODE)
+        saved_sort = self.config.get_str("sort/mode", DEFAULT_SORT_MODE)
+        idx_sort = self.combo_sort.findText(saved_sort)
+        if idx_sort >= 0:
+            self.combo_sort.setCurrentIndex(idx_sort)
         self.combo_sort.setMinimumWidth(110)
         self.combo_sort.setToolTip("按所选字段重新排列搜索结果，缺失的字段排在最后")
         self.combo_sort.currentIndexChanged.connect(self.on_sort_changed)
         batch.addWidget(self.combo_sort)
+
         self.check_sort_desc = QCheckBox("降序")
         self.check_sort_desc.setToolTip("勾选后按倒序排列")
+        self.check_sort_desc.setChecked(self.config.get_bool("sort/descending", False))
         self.check_sort_desc.stateChanged.connect(self.on_sort_changed)
         batch.addWidget(self.check_sort_desc)
 
@@ -2311,7 +2655,7 @@ class MusicDownloader(QMainWindow):
         batch.addSpacing(20)
         self.check_bilingual = QCheckBox("🌐 双语歌词")
         self.check_bilingual.setToolTip("下载外语歌时自动匹配并合并中文翻译（网易云/QQ音乐）")
-        bilingual_saved = QSettings("musicdl", "MusicDownloader").value("enable_bilingual_lyric", True, type=bool)
+        bilingual_saved = self.config.get_bool("lyrics/bilingual_enabled", True)
         self.check_bilingual.setChecked(bilingual_saved)
         self.check_bilingual.stateChanged.connect(self.on_bilingual_toggle)
         batch.addWidget(self.check_bilingual)
@@ -2320,7 +2664,7 @@ class MusicDownloader(QMainWindow):
         self.combo_lyric_layout.addItem("双行对齐", "dual_line")
         self.combo_lyric_layout.addItem("单行拼合 (｜)", "inline")
         self.combo_lyric_layout.addItem("仅中文翻译", "translation_only")
-        saved_layout = QSettings("musicdl", "MusicDownloader").value("bilingual_lyric_layout", "dual_line", type=str)
+        saved_layout = self.config.get_str("lyrics/layout", "dual_line")
         idx = self.combo_lyric_layout.findData(saved_layout)
         if idx >= 0:
             self.combo_lyric_layout.setCurrentIndex(idx)
@@ -2334,7 +2678,7 @@ class MusicDownloader(QMainWindow):
         self.combo_zh_convert.addItem("保持原样 (字形)", "keep")
         self.combo_zh_convert.addItem("统一为简体中文", "t2s")
         self.combo_zh_convert.addItem("统一为繁体中文", "s2t")
-        saved_zh_convert = QSettings("musicdl", "MusicDownloader").value("zh_convert_mode", "keep", type=str)
+        saved_zh_convert = self.config.get_str("lyrics/zh_convert", "keep")
         idx_zh = self.combo_zh_convert.findData(saved_zh_convert)
         if idx_zh >= 0:
             self.combo_zh_convert.setCurrentIndex(idx_zh)
@@ -2343,6 +2687,35 @@ class MusicDownloader(QMainWindow):
         batch.addWidget(self.combo_zh_convert)
 
         batch.addStretch()
+
+        # 任务看板呼出按钮（常驻，后台运行时动态显示微缩速率与进度）
+        self.btn_task_monitor = QPushButton("📊 任务看板")
+        self.btn_task_monitor.setObjectName("BtnTaskMonitor")
+        self.btn_task_monitor.setCursor(Qt.PointingHandCursor)
+        self.btn_task_monitor.setToolTip("查看当前正在运行的下载/搜索任务看板 (快捷键: Ctrl+T)")
+        self.btn_task_monitor.setStyleSheet("""
+            QPushButton#BtnTaskMonitor {
+                background-color: #f1f5f9;
+                color: #0078d4;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QPushButton#BtnTaskMonitor:hover {
+                background-color: #e2e8f0;
+                color: #005a9e;
+                border-color: #94a3b8;
+            }
+            QPushButton#BtnTaskMonitor:pressed {
+                background-color: #cbd5e1;
+            }
+        """)
+        self.btn_task_monitor.clicked.connect(self.show_active_progress_dialog)
+        batch.addWidget(self.btn_task_monitor)
+        batch.addSpacing(8)
+
         batch.addWidget(self.btn_download)
         layout.addLayout(batch)
         
@@ -2391,7 +2764,7 @@ class MusicDownloader(QMainWindow):
     # 自动下载开关切换（修改：不改变界面布局）
     def on_auto_download_toggle(self, state):
         self.auto_download_after_search = (state == Qt.Checked)
-        # 界面布局保持不变，只记录状态
+        self.config.set("download/auto_download", self.auto_download_after_search)
 
     def show_table_context_menu(self, pos):
         item = self.results_table.itemAt(pos)
@@ -2417,10 +2790,70 @@ class MusicDownloader(QMainWindow):
         
         menu.exec_(self.results_table.mapToGlobal(pos))
 
+    def _create_progress_dialog(self, title, message="", save_dir=None):
+        """创建过程监视弹窗：优先使用现代化多任务仪表盘 ModernProgressDialog，并支持随时唤回"""
+        if MODERN_PROGRESS_AVAILABLE and ModernProgressDialog:
+            dlg = ModernProgressDialog(title=title, save_dir=save_dir, parent=self)
+            self.active_progress_dialog = dlg
+            if hasattr(dlg, 'bridge') and dlg.bridge:
+                dlg.bridge.batch_updated.connect(self._on_telemetry_batch_main)
+            return dlg
+        dlg = SimpleProgressDialog(title, message, save_dir, self)
+        self.active_progress_dialog = dlg
+        return dlg
+
+    def _on_telemetry_batch_main(self, snapshot):
+        """当任务在后台运行（或看板隐藏）时，在主界面的【任务看板】按钮上微缩显示实时速率与进度"""
+        if not hasattr(self, 'btn_task_monitor'):
+            return
+        finished = snapshot.get("finished_tasks", 0)
+        total = snapshot.get("total_tasks", 0)
+        if total > 0 and finished >= total:
+            self.btn_task_monitor.setText("✔ 任务完成 (查看看板)")
+            self.btn_task_monitor.setStyleSheet("""
+                QPushButton#BtnTaskMonitor {
+                    background-color: #eafaf1; color: #27ae60; border: 1px solid #a3e4d7;
+                    border-radius: 6px; padding: 6px 14px; font-size: 9pt; font-weight: bold;
+                }
+                QPushButton#BtnTaskMonitor:hover { background-color: #d5f5e3; }
+            """)
+        else:
+            badge = snapshot.get("badge_text", f"{finished}/{total}")
+            speed = snapshot.get("overall_speed_display", "")
+            is_search = snapshot.get("category") == "search"
+            if is_search:
+                text = f"🔍 检索中 · {badge}"
+            elif speed and speed != "0 B/s":
+                text = f"⚡ 下载中 ({badge}) · {speed}"
+            else:
+                text = f"⚡ 下载中 ({badge})"
+            self.btn_task_monitor.setText(text)
+            self.btn_task_monitor.setStyleSheet("""
+                QPushButton#BtnTaskMonitor {
+                    background-color: #ebf5fb; color: #0078d4; border: 1px solid #99cbee;
+                    border-radius: 6px; padding: 6px 14px; font-size: 9pt; font-weight: bold;
+                }
+                QPushButton#BtnTaskMonitor:hover { background-color: #d4e6f1; }
+            """)
+
+    def show_active_progress_dialog(self):
+        """重新呼出并置顶正在运行或最近完成的任务看板"""
+        if self.active_progress_dialog:
+            if hasattr(self.active_progress_dialog, 'reopen'):
+                self.active_progress_dialog.reopen()
+            else:
+                self.active_progress_dialog.show()
+                self.active_progress_dialog.raise_()
+                self.active_progress_dialog.activateWindow()
+        else:
+            QMessageBox.information(self, "提示", "当前没有正在执行或暂存的任务看板。")
+
     def _connect_progress(self, dialog, thread):
         """把后台线程的真实进度和过程详情接到进度弹窗上。"""
-        thread.progress.connect(dialog.set_progress)
-        thread.log.connect(dialog.append_log)
+        if hasattr(dialog, "set_progress") and hasattr(thread, "progress"):
+            thread.progress.connect(dialog.set_progress)
+        if hasattr(dialog, "append_log") and hasattr(thread, "log"):
+            thread.log.connect(dialog.append_log)
 
     def download_current_row(self):
         if self.current_right_click_row < 0 or not self.music_client: return
@@ -2437,7 +2870,7 @@ class MusicDownloader(QMainWindow):
         )
         if reply != QMessageBox.Yes: return
         
-        dlg = SimpleProgressDialog("下载中", f"正在下载：{song_name}", self.save_dir, self)
+        dlg = self._create_progress_dialog("正在下载歌曲", f"正在下载：{song_name}", self.save_dir)
         dlg.show()
         enable_bi, layout, zh_convert = self.get_lyric_settings()
         self.download_thread = DownloadThread(
@@ -2520,10 +2953,21 @@ class MusicDownloader(QMainWindow):
         self.header_select.blockSignals(False)
 
     def on_browse_save_dir(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "选择保存目录", self.current_dir)
+        start_dir = self.save_dir if os.path.exists(self.save_dir) else self.app_dir
+        dir_path = QFileDialog.getExistingDirectory(self, "选择保存目录", start_dir)
         if dir_path:
-            self.save_dir = dir_path
-            self.save_dir_edit.setText(dir_path)
+            self.save_dir = os.path.abspath(dir_path)
+            self.save_dir_edit.setText(self.save_dir)
+            self.config.set("download/save_dir", self.save_dir)
+            _makedirs_music_folder(self.save_dir, exist_ok=True)
+
+    def on_open_save_dir(self):
+        target_dir = self.save_dir if os.path.exists(self.save_dir) else self.app_dir
+        _makedirs_music_folder(target_dir, exist_ok=True)
+        try:
+            os.startfile(target_dir)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"无法打开保存目录：{e}")
 
     def init_music_client(self):
         if not MUSICDL_AVAILABLE: return None
@@ -2694,15 +3138,15 @@ class MusicDownloader(QMainWindow):
 
     def on_bilingual_toggle(self, state):
         enabled = bool(state == Qt.Checked)
-        QSettings("musicdl", "MusicDownloader").setValue("enable_bilingual_lyric", enabled)
+        self.config.set("lyrics/bilingual_enabled", enabled)
 
     def on_lyric_layout_changed(self, index):
         layout = self.combo_lyric_layout.currentData()
-        QSettings("musicdl", "MusicDownloader").setValue("bilingual_lyric_layout", layout)
+        self.config.set("lyrics/layout", layout)
 
     def on_zh_convert_changed(self, index):
         mode = self.combo_zh_convert.currentData()
-        QSettings("musicdl", "MusicDownloader").setValue("zh_convert_mode", mode)
+        self.config.set("lyrics/zh_convert", mode)
 
     def get_lyric_settings(self):
         enabled = self.check_bilingual.isChecked() if hasattr(self, 'check_bilingual') else True
@@ -2711,7 +3155,9 @@ class MusicDownloader(QMainWindow):
         return enabled, layout, zh_convert
 
     def on_sort_changed(self, *args):
-        """排序方式变化后立即重排表格（保留勾选状态，封面走缓存）。"""
+        """排序方式变化后立即保存偏好并重排表格（保留勾选状态，封面走缓存）。"""
+        self.config.set("sort/mode", self.combo_sort.currentText())
+        self.config.set("sort/descending", self.check_sort_desc.isChecked())
         if not self.all_songs:
             return
         self.render_songs()
@@ -2798,7 +3244,7 @@ class MusicDownloader(QMainWindow):
         if not all_songs or not self.music_client: return
         
         # 直接显示下载弹窗，显示保存位置
-        dlg = SimpleProgressDialog("🚀 自动下载中", f"正在下载 {len(all_songs)} 首歌曲", self.save_dir, self)
+        dlg = self._create_progress_dialog("🚀 自动下载中", f"正在下载 {len(all_songs)} 首歌曲", self.save_dir)
         dlg.show()
         
         enable_bi, layout, zh_convert = self.get_lyric_settings()
@@ -2889,9 +3335,10 @@ class MusicDownloader(QMainWindow):
         if not keyword:
             QMessageBox.warning(self, "提示", "请输入搜索内容！")
             return
+        self.add_search_history(keyword)
         self.music_client = self.init_music_client()
         if not self.music_client: return
-        dlg = SimpleProgressDialog("搜索中", f"正在搜索「{keyword}」…", None, self)
+        dlg = self._create_progress_dialog("聚合搜索中", f"正在搜索「{keyword}」…", None)
         dlg.show()
         self.search_thread = SearchThread(self.music_client, keyword, self.search_mode.currentText(), self.source_map_en_to_cn)
         self._connect_progress(dlg, self.search_thread)
@@ -2934,7 +3381,7 @@ class MusicDownloader(QMainWindow):
         )
         if reply != QMessageBox.Yes: return
         
-        dlg = SimpleProgressDialog("下载中", f"正在下载 {len(songs_to_download)} 首歌曲", self.save_dir, self)
+        dlg = self._create_progress_dialog("批量下载中", f"正在下载 {len(songs_to_download)} 首歌曲", self.save_dir)
         dlg.show()
         enable_bi, layout, zh_convert = self.get_lyric_settings()
         self.download_thread = DownloadThread(
@@ -2960,6 +3407,163 @@ class MusicDownloader(QMainWindow):
         self.download_thread.finished.connect(on_finished)
         self.download_thread.error.connect(on_error)
         self.download_thread.start()
+
+    # ==================== 偏好设置交互与生命周期方法 ====================
+
+    def on_source_selection_changed(self):
+        """音源复选框变更时自动保存偏好。"""
+        selected = [cb.text() for cb in self.source_checkboxes if cb.isChecked()]
+        self.config.set("sources/selected", selected)
+
+    def select_all_sources(self):
+        """快捷全选所有音源。"""
+        for cb in self.source_checkboxes:
+            cb.setChecked(True)
+
+    def clear_all_sources(self):
+        """快捷清空所有音源勾选。"""
+        for cb in self.source_checkboxes:
+            cb.setChecked(False)
+
+    def select_domestic_sources(self):
+        """快捷选中 8 大国内主流音源。"""
+        domestic = {"网易云音乐", "QQ音乐", "酷狗音乐", "酷我音乐", "咪咕音乐", "汽水音乐", "千千音乐", "5sing"}
+        for cb in self.source_checkboxes:
+            cb.setChecked(cb.text() in domestic)
+
+    def reset_default_sources(self):
+        """快捷恢复初始默认音源勾选（网易云音乐）。"""
+        for cb in self.source_checkboxes:
+            cb.setChecked(cb.text() in DEFAULT_SOURCES)
+
+    def add_search_history(self, term):
+        """记录搜索历史并刷新自动补全列表。"""
+        if not term:
+            return
+        term = term.strip()
+        if not term:
+            return
+        if term in self.search_history:
+            self.search_history.remove(term)
+        self.search_history.insert(0, term)
+        self.search_history = self.search_history[:25]
+        self.config.set("search/history", self.search_history)
+        self.history_model.setStringList(self.search_history)
+
+    def on_open_config_dir(self):
+        """在文件资源管理器中定位并打开 config.ini 配置文件。"""
+        cfg_path = self.config.get_config_path()
+        cfg_dir = os.path.dirname(cfg_path)
+        if os.path.exists(cfg_path):
+            try:
+                import subprocess
+                subprocess.Popen(f'explorer /select,"{cfg_path}"')
+                return
+            except Exception:
+                pass
+        os.startfile(cfg_dir)
+
+    def on_clear_search_history(self):
+        """清空搜索关键词历史记录。"""
+        self.search_history = []
+        self.config.set("search/history", [])
+        self.history_model.setStringList([])
+        QMessageBox.information(self, "提示", "搜索历史记录已清空！")
+
+    def on_reset_preferences(self):
+        """恢复所有出厂默认偏好设置。"""
+        reply = QMessageBox.question(
+            self, "恢复出厂偏好",
+            "确定要重置所有记住的偏好设置（保存目录、音源选择、排序、窗口状态等）并恢复出厂默认吗？\n\n（已下载的音乐文件不会受到任何影响）",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.config.reset_to_defaults()
+        self.reload_ui_from_config()
+        QMessageBox.information(self, "提示", "已成功重置所有偏好设置至初始默认状态！")
+
+    def reload_ui_from_config(self):
+        """从配置中全量刷新回填界面控件状态。"""
+        # 1. 恢复保存目录
+        default_save_dir = os.path.join(self.app_dir, "已下载音乐")
+        self.save_dir = default_save_dir
+        self.save_dir_edit.setText(self.save_dir)
+        _makedirs_music_folder(self.save_dir, exist_ok=True)
+        
+        # 2. 恢复音源选择
+        saved_sources = set(self.config.get_list("sources/selected", DEFAULT_SOURCES))
+        for cb in self.source_checkboxes:
+            cb.blockSignals(True)
+            cb.setChecked(cb.text() in saved_sources)
+            cb.blockSignals(False)
+            
+        # 3. 恢复单源抓取限制
+        self.spin_limit.blockSignals(True)
+        self.spin_limit.setValue(self.config.get_int("download/limit_per_source", 100))
+        self.spin_limit.blockSignals(False)
+        
+        # 4. 恢复自动下载开关
+        self.check_auto_download.blockSignals(True)
+        self.auto_download_after_search = self.config.get_bool("download/auto_download", False)
+        self.check_auto_download.setChecked(self.auto_download_after_search)
+        self.check_auto_download.blockSignals(False)
+        
+        # 5. 恢复搜索模式
+        self.search_mode.blockSignals(True)
+        idx_mode = self.search_mode.findText(self.config.get_str("search/mode", "搜索歌曲"))
+        if idx_mode >= 0:
+            self.search_mode.setCurrentIndex(idx_mode)
+        self.search_mode.blockSignals(False)
+        
+        # 6. 恢复下载范围
+        self.combo_download_scope.blockSignals(True)
+        idx_scope = self.combo_download_scope.findText(self.config.get_str("download/scope", DEFAULT_DOWNLOAD_SCOPE))
+        if idx_scope >= 0:
+            self.combo_download_scope.setCurrentIndex(idx_scope)
+        self.combo_download_scope.blockSignals(False)
+        
+        # 7. 恢复排序字段与降序
+        self.combo_sort.blockSignals(True)
+        idx_sort = self.combo_sort.findText(self.config.get_str("sort/mode", DEFAULT_SORT_MODE))
+        if idx_sort >= 0:
+            self.combo_sort.setCurrentIndex(idx_sort)
+        self.combo_sort.blockSignals(False)
+        
+        self.check_sort_desc.blockSignals(True)
+        self.check_sort_desc.setChecked(self.config.get_bool("sort/descending", False))
+        self.check_sort_desc.blockSignals(False)
+        
+        # 8. 恢复双语歌词与简繁转换
+        self.check_bilingual.blockSignals(True)
+        self.check_bilingual.setChecked(self.config.get_bool("lyrics/bilingual_enabled", True))
+        self.check_bilingual.blockSignals(False)
+        
+        self.combo_lyric_layout.blockSignals(True)
+        idx_layout = self.combo_lyric_layout.findData(self.config.get_str("lyrics/layout", "dual_line"))
+        if idx_layout >= 0:
+            self.combo_lyric_layout.setCurrentIndex(idx_layout)
+        self.combo_lyric_layout.blockSignals(False)
+        
+        self.combo_zh_convert.blockSignals(True)
+        idx_zh = self.combo_zh_convert.findData(self.config.get_str("lyrics/zh_convert", "keep"))
+        if idx_zh >= 0:
+            self.combo_zh_convert.setCurrentIndex(idx_zh)
+        self.combo_zh_convert.blockSignals(False)
+        
+        # 9. 恢复默认窗口尺寸
+        self.resize(1400, 900)
+
+    def closeEvent(self, event):
+        """窗口关闭时自动静默保存窗口尺寸、位置和表格列宽。"""
+        try:
+            self.config.set("ui/window_geometry", self.saveGeometry())
+            self.config.set("ui/table_header_state", self.results_table.horizontalHeader().saveState())
+            self.config.sync()
+        except Exception as e:
+            print(f"保存偏好设置时出错: {e}")
+        super().closeEvent(event)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

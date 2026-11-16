@@ -18,6 +18,10 @@ __pycache__/
 /temp_test/
 /musicdl_outputs/
 
+# User local preferences & config
+config.ini
+*.ini
+
 # User Downloaded Music Data
 /已下载音乐/
 
