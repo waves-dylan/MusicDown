@@ -1,4 +1,17 @@
-requests
-PyQt5
-musicdl
-PySide6
+# GUI 桌面界面框架
+PyQt5>=5.15.2
+
+# 音乐检索与下载核心引擎
+musicdl>=2.14.2
+
+# 音频元数据与标签处理（封面、ID3、歌词嵌入）
+mutagen>=1.46.0
+
+# 网络请求与双语歌词拉取
+requests>=2.28.0
+
+# 中文简繁体转换
+zhconv>=1.4.3
+
+# 项目打包工具（运行 make_release.bat 必需）
+pyinstaller>=6.0.0

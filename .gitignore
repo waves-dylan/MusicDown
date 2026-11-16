@@ -1,4 +1,25 @@
-/.musicdl_temp
-/build
-/dist
-/*.spec
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build
+/build/
+/dist/
+*.exe
+
+# Virtual environment & Tools
+/.venv/
+/tools/
+
+# Temporary / Staging / Test outputs
+/.musicdl_temp/
+/.musicdl_staging/
+/temp_test/
+/musicdl_outputs/
+
+# User Downloaded Music Data
+/已下载音乐/
+
+# Personal memo
+启动代码.txt
