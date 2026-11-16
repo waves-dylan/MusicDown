@@ -9,7 +9,6 @@
   <img alt="GUI Framework" src="https://img.shields.io/badge/GUI-PyQt5-green.svg">
   <img alt="Release Build" src="https://img.shields.io/badge/Build-PyInstaller%20%2B%20UPX-orange.svg">
   <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows-lightgrey.svg">
-  <img alt="Downloads" src="https://img.shields.io/github/downloads/waves-dylan/MusicDown/total?label=下载量&color=brightgreen">
 </p>
 
 **MusicDownload** 是一款基于 Python 和 PyQt5 构建的高性能全功能音乐下载与元数据增强工具。本项目以开源项目 [musicdl](https://github.com/CharlesPikachu/musicdl) 为基础引擎，进行了深度的架构重构、功能扩展与交互现代化改造，全面解决了原版在音源匹配、元数据写入、歌词对齐及打包体积上的痛点。
